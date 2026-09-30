@@ -33,16 +33,18 @@ entrypoint, which would otherwise initialise and start a database server.
    stranger's must not; `pg_restore` must read it; `rclone` and `curl -K` must work.
 3. Only if both smoke tests pass is the multi-arch index created and tagged `:<commit sha>`.
    The run summary prints the index digest to pin.
-   Every GitHub Action is pinned by full commit SHA: the image reads databases in plaintext
-   before it encrypts them, so a moved tag must not be able to run code in its build.
+   Every GitHub Action is pinned by full commit SHA, and the BuildKit image that runs the build
+   by digest: the image reads databases in plaintext before it encrypts them, so a moved tag must
+   not be able to run code in its build.
 4. The `public` job proves an anonymous client can pull that digest, with a control showing
    the same procedure returns something other than 200 for a package that does not exist.
 
 **Pin the index digest from a green run's summary, and cite the run.** Nothing else is a pin:
 not a tag, and not a digest looked up later.
 
-A new GHCR package starts **private**, so the first run's `public` job fails. Change the
-package's visibility to public in its settings, then re-run that job.
+If the package is **private**, the `public` job fails. Change the package's visibility to public
+in its settings, then re-run that job. (Its first run did not fail: the job ran with no credential
+in scope, so the package was already public by then.)
 
 Run the smoke test locally:
 
