@@ -1,0 +1,3 @@
+# The Dockerfile copies nothing from this repo, so the build context is empty on purpose:
+# nothing here (.git included) can ever end up in the image.
+*

@@ -1,0 +1,180 @@
+# Build the image for linux/amd64 and linux/arm64, prove each natively, then publish ONE
+# multi-arch index to GHCR. Consumers pin that index by digest, and only from a GREEN run of this
+# workflow, citing the run.
+#
+# THE SHAPE, AND WHY:
+#   build-amd64, build-arm64   each on a NATIVE runner (public repos get arm64 runners free):
+#                              build, push BY DIGEST ONLY (untagged), then run test/smoke.sh
+#                              against that exact digest. No QEMU anywhere: the arm64 proof must
+#                              be arm64. Under emulation a smoke test can fail, or pass, for
+#                              reasons that are the emulator's, not the image's.
+#   index                      runs only if BOTH smoke tests passed. It creates the index, tags it
+#                              :<full sha> (immutable by being pushed once), checks it lists
+#                              exactly the two tested digests, and prints the digest to pin.
+#   public                     consumers pull with NO credential, so the package must be public.
+#                              Proven anonymously, with a control that proves the procedure can
+#                              say "no".
+# An untested digest can exist (a smoke test failed after its push), but nothing points at it: no
+# tag, no index, no summary line. The pin is always the index digest from this run's summary.
+#
+# ⚠ FIRST RUN: GHCR creates a new package PRIVATE. The `public` job then fails, correctly. Make
+# it public (package settings → Change visibility → Public) and re-run that job; the run goes
+# green without rebuilding anything.
+#
+# EVERY ACTION IS PINNED BY FULL COMMIT SHA, its release tag in a comment. The image this workflow
+# builds reads whole databases in plaintext before it encrypts them, so an action whose tag was
+# moved to malicious code (the tj-actions/changed-files incident, 2025) would run inside this build
+# and could plant code in the image. A commit SHA cannot be moved. To update a pin: resolve the new
+# release tag to its commit (`git ls-remote --tags https://github.com/<owner>/<action>`), read that
+# release, and change the SHA and its comment together. The smoke test's Postgres is pinned by
+# digest for the same reason, since it runs inside the build jobs too.
+#
+# NOT HERE, deliberately: signing, SBOM, provenance (provenance: false and sbom: false are
+# exclusions; buildx adds provenance by default).
+name: image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/nerdoutcj/grid-backup-image
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-24.04
+    permissions: {contents: read, packages: write}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest (no tag)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+      - name: Smoke test that exact digest, natively, under the pod's constraints
+        run: test/smoke.sh "${IMAGE}@${{ steps.build.outputs.digest }}" x86_64
+
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    permissions: {contents: read, packages: write}
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest (no tag)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+      - name: Smoke test that exact digest, natively, under the pod's constraints
+        # smoke.sh refuses to run unless the HOST is aarch64: if this job is ever moved to an
+        # emulated runner, the proof fails instead of quietly counting.
+        run: test/smoke.sh "${IMAGE}@${{ steps.build.outputs.digest }}" aarch64
+
+  index:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-24.04
+    permissions: {contents: read, packages: write}
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch index from the two TESTED digests
+        id: index
+        env:
+          AMD: ${{ needs.build-amd64.outputs.digest }}
+          ARM: ${{ needs.build-arm64.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$AMD" && test -n "$ARM"
+          docker buildx imagetools create -t "${IMAGE}:${GITHUB_SHA}" "${IMAGE}@${AMD}" "${IMAGE}@${ARM}"
+          # The digest the REGISTRY reports for the tag. (Not a sha256 of `$(… --raw)`: command
+          # substitution strips trailing newlines, and the digest is over the exact bytes.)
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}" | awk '/^Digest:/ {print $2; exit}')"
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no index digest read back"; exit 1; }
+          raw="$(docker buildx imagetools inspect --raw "${IMAGE}@${digest}")"
+          # Exactly the two tested manifests, each under its platform, and nothing else.
+          got="$(printf '%s' "$raw" | jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' | sort)"
+          want="$(printf 'linux/amd64 %s\nlinux/arm64 %s\n' "$AMD" "$ARM" | sort)"
+          echo "$got"
+          test "$got" = "$want" || { echo "::error::the index does not list exactly the two tested digests"; exit 1; }
+          # And the registry serves the index under that digest.
+          docker buildx imagetools inspect "${IMAGE}@${digest}" > /dev/null
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### grid-backup-image at ${GITHUB_SHA}"
+            echo ""
+            echo "| what | value |"
+            echo "|---|---|"
+            echo "| **pin this** (multi-arch index) | \`${IMAGE}@${digest}\` |"
+            echo "| linux/amd64 (smoke-tested) | \`${AMD}\` |"
+            echo "| linux/arm64 (smoke-tested) | \`${ARM}\` |"
+            echo "| tag | \`${IMAGE}:${GITHUB_SHA}\` |"
+            echo ""
+            echo "Pin only if this whole run is green, and cite run ${GITHUB_RUN_ID} wherever it is pinned."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  public:
+    needs: index
+    runs-on: ubuntu-24.04
+    # NO permissions and NO login: the anonymous arm must carry no credential at all.
+    permissions: {}
+    steps:
+      - name: Anonymous pull of the index works; the procedure can also refuse
+        env:
+          DIGEST: ${{ needs.index.outputs.digest }}
+        run: |
+          set -uo pipefail
+          repo="${IMAGE#ghcr.io/}"
+          accept='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json'
+          anon() {  # repo ref -> HTTP code of an anonymous manifest GET, with an anonymous token if issued
+            local tok code auth=()
+            tok="$(curl -s "https://ghcr.io/token?scope=repository:$1:pull&service=ghcr.io" | jq -r '.token // empty' 2>/dev/null || true)"
+            [ -n "$tok" ] && auth=(-H "Authorization: Bearer ${tok}")
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${auth[@]}" \
+                     -H "Accept: ${accept}" "https://ghcr.io/v2/$1/manifests/$2" || true)"
+            printf '%s' "${code:-000}"
+          }
+          code="$(anon "$repo" "$DIGEST")"
+          echo "anonymous GET ${repo}@${DIGEST}: HTTP ${code}"
+          # CONTROL: the same procedure against a name that cannot exist must NOT return 200, or a
+          # 200 above proves nothing about this package.
+          ctl="$(anon "${repo}-does-not-exist-$(date +%s)" "$DIGEST")"
+          echo "control, nonexistent package: HTTP ${ctl}"
+          test "$ctl" != 200 || { echo "::error::the control returned 200; the check cannot tell public from absent"; exit 1; }
+          test "$code" = 200 || { echo "::error::the package is not anonymously pullable (HTTP ${code}). A NEW package starts PRIVATE: make it public, then re-run this job."; exit 1; }
+          echo "PUBLIC: ${IMAGE}@${DIGEST} can be pulled with no credential"
